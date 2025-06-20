@@ -2,60 +2,92 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+
+	_ "modernc.org/sqlite" // pure-Go SQLite driver
 
 	"github.com/mdp/qrterminal/v3"
 	"go.mau.fi/whatsmeow"
-	"go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
+	waLog "go.mau.fi/whatsmeow/util/log"
 )
 
 var client *whatsmeow.Client
 
-const groupJIDStr = "1234567890-123456789@g.us" // Replace with your actual group ID
+const groupJIDStr = "1234567890-123456789@g.us" // Replace with your group JID
+
 var groupJID = types.NewJID(groupJIDStr, "g.us")
 
-func main() {
-	dbLog := log.New(os.Stdout, "SQL: ", log.Lshortfile)
-	container, err := sqlstore.New("sqlite", "file:store.db?_foreign_keys=on", dbLog)
+func openSqliteDB(path string) (*sql.DB, error) {
+	db, err := sql.Open("sqlite", path)
 	if err != nil {
-		log.Fatalf("Failed to create store: %v", err)
+		return nil, err
+	}
+	// Enable foreign keys
+	if _, err := db.Exec("PRAGMA foreign_keys = ON"); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
+func main() {
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	dbPath := "./store.db"
+	db, err := openSqliteDB(dbPath)
+	if err != nil {
+		log.Fatalf("Failed to open SQLite DB: %v", err)
 	}
 
-	deviceStore, err := container.GetFirstDevice()
+	dbLogger := waLog.Stdout("SQLSTORE", "INFO", true)
+
+	container := sqlstore.NewWithDB(db, "sqlite", dbLogger)
+	if err != nil {
+		log.Fatalf("Failed to create SQL store container: %v", err)
+	}
+
+	device, err := container.GetFirstDevice(ctx)
 	if err != nil {
 		log.Fatalf("Failed to get device: %v", err)
 	}
 
-	client = whatsmeow.NewClient(deviceStore, nil)
+	clientLogger := waLog.Stdout("CLIENT", "INFO", true)
+	client = whatsmeow.NewClient(device, clientLogger)
 
 	if client.Store.ID == nil {
-		log.Println("No session found, scanning QR...")
-		qrChan, _ := client.GetQRChannel(context.Background())
-		err = client.Connect()
-		if err != nil {
-			log.Fatalf("Failed to connect: %v", err)
-		}
-		for evt := range qrChan {
-			if evt.Event == "code" {
-				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
-			} else if evt.Event == "success" {
-				log.Println("Login successful!")
-			} else if evt.Event == "timeout" || evt.Event == "error" {
-				log.Fatalf("Login failed: %v", evt.Event)
+		log.Println("No session found, please scan QR code to login:")
+		qrChan, _ := client.GetQRChannel(ctx)
+		go func() {
+			for evt := range qrChan {
+				if evt.Event == "code" {
+					qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+				} else if evt.Event == "success" {
+					log.Println("✅ Login successful")
+				} else if evt.Event == "timeout" {
+					log.Println("QR code timeout, please restart")
+				}
 			}
+		}()
+
+		if err := client.Connect(); err != nil {
+			log.Fatalf("Failed to connect client: %v", err)
 		}
 	} else {
-		err = client.Connect()
-		if err != nil {
-			log.Fatalf("Failed to connect: %v", err)
+		if err := client.Connect(); err != nil {
+			log.Fatalf("Failed to reconnect client: %v", err)
 		}
-		log.Println("Connected with restored session")
+		log.Println("✅ Reconnected to WhatsApp")
 	}
 
 	http.HandleFunc("/health", wrap(handleHealth))
@@ -64,16 +96,24 @@ func main() {
 	http.HandleFunc("/group/remove", wrap(handleRemoveMember))
 	http.HandleFunc("/group/send_contact", wrap(handleSendContact))
 
-	log.Println("Server started at :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	log.Println("HTTP server listening on :8080")
+	go func() {
+		if err := http.ListenAndServe(":8080", nil); err != nil {
+			log.Fatalf("HTTP server error: %v", err)
+		}
+	}()
+
+	<-ctx.Done()
+	log.Println("Shutting down...")
+	client.Disconnect()
 }
 
 func wrap(h func(http.ResponseWriter, *http.Request)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
-			if e := recover(); e != nil {
-				log.Printf("panic: %v", e)
-				http.Error(w, "Internal server error", 500)
+			if rec := recover(); rec != nil {
+				log.Printf("Panic: %v", rec)
+				http.Error(w, "Internal server error", http.StatusInternalServerError)
 			}
 		}()
 		h(w, r)
@@ -91,7 +131,7 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 func handleListMembers(w http.ResponseWriter, r *http.Request) {
 	info, err := client.GetGroupInfo(groupJID)
 	if err != nil {
-		http.Error(w, "Failed to get group info: "+err.Error(), 500)
+		http.Error(w, "Failed to get group info: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -107,38 +147,42 @@ func handleListMembers(w http.ResponseWriter, r *http.Request) {
 func handleAddMember(w http.ResponseWriter, r *http.Request) {
 	phone := r.URL.Query().Get("phone")
 	if phone == "" {
-		http.Error(w, "Missing phone param", 400)
+		http.Error(w, "Missing phone parameter", http.StatusBadRequest)
 		return
 	}
 	jid := types.NewJID(phone, "s.whatsapp.net")
-	err := client.AddGroupParticipants(groupJID, []types.JID{jid})
+
+	_, err := client.UpdateGroupParticipants(groupJID, []types.JID{jid}, whatsmeow.ParticipantChangeAdd)
 	if err != nil {
-		http.Error(w, "Failed to add: "+err.Error(), 500)
+		http.Error(w, "Failed to add member: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	fmt.Fprintln(w, "Added")
+
+	w.Write([]byte("Member added"))
 }
 
 func handleRemoveMember(w http.ResponseWriter, r *http.Request) {
 	phone := r.URL.Query().Get("phone")
 	if phone == "" {
-		http.Error(w, "Missing phone param", 400)
+		http.Error(w, "Missing phone parameter", http.StatusBadRequest)
 		return
 	}
 	jid := types.NewJID(phone, "s.whatsapp.net")
-	err := client.RemoveGroupParticipant(groupJID, jid)
+
+	_, err := client.UpdateGroupParticipants(groupJID, []types.JID{jid}, whatsmeow.ParticipantChangeRemove)
 	if err != nil {
-		http.Error(w, "Failed to remove: "+err.Error(), 500)
+		http.Error(w, "Failed to remove member: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	fmt.Fprintln(w, "Removed")
+
+	w.Write([]byte("Member removed"))
 }
 
 func handleSendContact(w http.ResponseWriter, r *http.Request) {
 	name := r.URL.Query().Get("name")
 	phone := r.URL.Query().Get("phone")
 	if name == "" || phone == "" {
-		http.Error(w, "Missing name or phone param", 400)
+		http.Error(w, "Missing name or phone parameter", http.StatusBadRequest)
 		return
 	}
 
@@ -148,21 +192,17 @@ FN:%s
 TEL;TYPE=CELL:%s
 END:VCARD`, name, phone)
 
-	msg := &proto.Message{
-		ContactMessage: &proto.ContactMessage{
+	msg := &waE2E.Message{
+		ContactMessage: &waE2E.ContactMessage{
 			DisplayName: &name,
-			Vcard:       protoString(vcard),
+			Vcard:       &vcard,
 		},
 	}
 
-	_, err := client.SendMessage(context.Background(), groupJID, "", msg)
-	if err != nil {
-		http.Error(w, "Failed to send contact: "+err.Error(), 500)
+	if _, err := client.SendMessage(context.Background(), groupJID, msg); err != nil {
+		http.Error(w, "Failed to send contact: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	fmt.Fprintln(w, "Contact sent")
-}
 
-func protoString(s string) *string {
-	return &s
+	w.Write([]byte("Contact sent"))
 }
