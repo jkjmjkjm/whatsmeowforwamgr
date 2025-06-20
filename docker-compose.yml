@@ -1,7 +1,5 @@
-version: '3.8'
-
 services:
-  whatsapp-adapter-api:
+  whatsapp:
     image: aldinokemal2104/go-whatsapp-web-multidevice
     container_name: whatsapp
     restart: always
@@ -15,3 +13,6 @@ services:
       - --debug=true
       - --os=Chrome
       - --account-validation=false
+
+volumes:
+  whatsapp:
