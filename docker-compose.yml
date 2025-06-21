@@ -12,7 +12,7 @@ services:
       - APP_OS=Chrome
       - APP_ACCOUNT_VALIDATION=true
 
-web:
+  web:
     build: nginx
     container_name: nginxReverseProxyHttps
     restart: always
