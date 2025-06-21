@@ -3,8 +3,6 @@ services:
     image: aldinokemal2104/go-whatsapp-web-multidevice
     container_name: whatsapp
     restart: always
-    ports:
-      - "3000:3000"
     volumes:
       - whatsapp:/app/storages
     environment:
@@ -13,6 +11,21 @@ services:
       - APP_DEBUG=true
       - APP_OS=Chrome
       - APP_ACCOUNT_VALIDATION=true
+
+web:
+    build: nginx
+    container_name: nginxReverseProxyHttps
+    restart: always
+    ports:
+      - 80:80
+      - 443:443
+    volumes:
+      - ./nginx/conf.d/:/etc/nginx/conf.d
+      - ./passwd/:/etc/nginx/passwd
+      - ./letsencrypt/:/etc/letsencrypt/
+      - ./certificates/certs/:/etc/nginx/certs
+      - ./certificates/private/:/etc/nginx/private
+      - ./logs/:/var/log/nginx/
 
 volumes:
   whatsapp:
